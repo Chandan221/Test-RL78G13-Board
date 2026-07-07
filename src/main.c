@@ -218,8 +218,8 @@ static void Clock_Init(void)
     /* Select main clock source (just in case CSS was changed by debugger) */
     CSC &= ~0x80U;
 
-    /* fCLK = fMAIN / 1  -- maximum CPU clock */
-    CKC  = 0x00U;
+    /* fCLK = fMAIN / 1  -- clear MCM0-2, preserve other bits */
+    CKC &= 0xF8U;
 }
 
 /******************************************************************************

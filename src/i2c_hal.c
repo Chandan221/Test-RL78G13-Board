@@ -53,171 +53,229 @@ static volatile unsigned char * const pm6  = (unsigned char *)0xFFF26;
 #define SCL_PIN   0x01U   /* P60/SCLA0 -- bit 0 */
 #define SDA_PIN   0x02U   /* P61/SDAA0 -- bit 1 */
 
-/* Clock-stretch timeout in busy-wait iterations (~100 ms at 20 MHz) */
-#define I2C_TIMEOUT  10000U
+/* Clock-stretch timeout in busy-wait iterations (~5 ms at 8 MHz) */
+#define I2C_TIMEOUT  1000U
 
 /******************************************************************************
  * Private:  Bus-level primitives
  ******************************************************************************/
 
-/* ---- SDA / SCL primitives ---------------------------------------------- */
-
 /**
- * Drive SCL low or high.
- *
- * @param[in] level  0 = low (sink), 1 = high (released with pull-up).
+ * Microsecond-scale delay for I2C timing.
+ * Calibrated for 8 MHz HOCO; yields approximately 5 us per call.
  */
-static void i2c_scl(uint8_t level)
+static void i2c_delay(void)
 {
-    if (level)
-        P6_REG |=  SCL_PIN;
-    else
-        P6_REG &= ~SCL_PIN;
-}
-
-/**
- * Drive SDA low or high.
- *
- * @param[in] level  0 = low (sink), 1 = high (released with pull-up).
- */
-static void i2c_sda(uint8_t level)
-{
-    if (level)
-        P6_REG |=  SDA_PIN;
-    else
-        P6_REG &= ~SDA_PIN;
-}
-
-/**
- * Read the current SDA pin level.
- *
- * @return  1 if SDA is high, 0 if low.
- */
-static uint8_t i2c_read_sda(void)
-{
-    return (uint8_t)((P6_REG & SDA_PIN) != 0U);
-}
-
-/**
- * Release SCL (driven high) and wait for clock stretch by the slave.
- *
- * If the slave holds SCL low (clock stretching), this function polls
- * until SCL goes high or a timeout expires.
- *
- * @return  1 if SCL rose (OK), 0 if timeout (slave stuck).
- */
-static uint8_t i2c_release_scl(void)
-{
-    uint16_t timeout = I2C_TIMEOUT;
-
-    P6_REG |= SCL_PIN;               /* drive SCL high */
-    while ((P6_REG & SCL_PIN) == 0U) /* wait for release */
+    volatile uint16_t i;
+    for (i = 0; i < 15U; i++)
     {
-        if (--timeout == 0U)
-            return 0U;               /* timeout */
+        /* empty */
     }
-    return 1U;                       /* OK */
 }
 
-/* ---- Bus-level operations ---------------------------------------------- */
+/**
+ * Drive SCL high (output mode, set bit).
+ */
+static void scl_high(void)
+{
+    P6_REG |= SCL_PIN;
+}
 
 /**
- * Generate an I2C START condition:
- *   SDA goes low while SCL is high.
+ * Drive SCL low (output mode, clear bit).
+ */
+static void scl_low(void)
+{
+    P6_REG &= ~SCL_PIN;
+}
+
+/**
+ * Release SDA (switch to input -- external pull-up drives it high).
+ */
+static void sda_release(void)
+{
+    PM6_REG |= SDA_PIN;         /* input = high-Z */
+}
+
+/**
+ * Drive SDA low (switch to output, clear data bit).
+ */
+static void sda_assert(void)
+{
+    PM6_REG &= ~SDA_PIN;        /* output */
+    P6_REG  &= ~SDA_PIN;        /* low */
+}
+
+/**
+ * Read the current SDA line level.
+ *
+ * @return 1 if SDA is high, 0 if low.
+ */
+static uint8_t sda_read(void)
+{
+    sda_release();
+    i2c_delay();
+    return (P6_REG & SDA_PIN) ? 1U : 0U;
+}
+
+/******************************************************************************
+ * Private:  I2C protocol primitives
+ ******************************************************************************/
+
+/**
+ * Generate START condition: SDA falls while SCL is high.
  */
 static void i2c_start(void)
 {
-    i2c_sda(1U);                     /* SDA high */
-    i2c_scl(1U);                     /* SCL high */
-    i2c_sda(0U);                     /* SDA falling while SCL high */
-    i2c_scl(0U);                     /* SCL low for data */
+    sda_release();
+    scl_high();
+    i2c_delay();
+    sda_assert();
+    i2c_delay();
+    scl_low();
+    i2c_delay();
 }
 
 /**
- * Generate an I2C STOP condition:
- *   SDA goes high while SCL is high.
+ * Generate STOP condition: SDA rises while SCL is high.
  */
 static void i2c_stop(void)
 {
-    i2c_scl(0U);                     /* ensure SCL low first */
-    i2c_sda(0U);                     /* SDA low */
-    i2c_scl(1U);                     /* SCL rising */
-    i2c_sda(1U);                     /* SDA rising while SCL high */
+    sda_assert();
+    i2c_delay();
+    scl_high();
+    i2c_delay();
+    sda_release();
+    i2c_delay();
 }
 
 /**
- * Transmit one byte on the I2C bus and read the ACK bit.
- *
- * @param[in] data  Byte to send.
- * @return  1 if slave ACK'd (SDA low), 0 if NACK.
+ * Generate an ACK (master pulls SDA low for one SCL cycle).
  */
-static uint8_t i2c_tx_byte(uint8_t data)
+static void i2c_ack(void)
 {
-    uint8_t i;
-    uint8_t ack;
+    scl_low();
+    i2c_delay();
+    sda_assert();
+    i2c_delay();
+    scl_high();
+    i2c_delay();
+    scl_low();
+    i2c_delay();
+}
 
-    for (i = 0U; i < 8U; i++)
+/**
+ * Generate a NACK (master leaves SDA high for one SCL cycle).
+ */
+static void i2c_nack(void)
+{
+    scl_low();
+    i2c_delay();
+    sda_release();
+    i2c_delay();
+    scl_high();
+    i2c_delay();
+    scl_low();
+    i2c_delay();
+}
+
+/**
+ * Wait for an ACK from the slave.
+ *
+ * After transmitting 8 bits, the master releases SDA and checks
+ * whether the slave pulls it low (ACK) or leaves it high (NACK).
+ *
+ * @return 0 if ACK received, 1 if NACK or timeout.
+ */
+static uint8_t i2c_wait_ack(void)
+{
+    uint16_t timeout = 0U;
+
+    sda_release();
+    i2c_delay();
+    scl_high();
+    i2c_delay();
+
+    while (sda_read() != 0U)
     {
-        /* Set SDA while SCL is low */
-        if (data & 0x80U)
-            i2c_sda(1U);
+        timeout++;
+        if (timeout > I2C_TIMEOUT)
+        {
+            scl_low();
+            return 1U;                      /* timeout / NACK */
+        }
+    }
+
+    scl_low();
+    i2c_delay();
+    return 0U;                              /* ACK received */
+}
+
+/******************************************************************************
+ * Private:  Byte-level I/O
+ ******************************************************************************/
+
+/**
+ * Transmit one byte MSB-first over I2C.
+ *
+ * @param[in] data  Byte to transmit.
+ * @return 0 if slave ACKed, 1 if NACKed.
+ */
+static uint8_t i2c_write_byte(uint8_t data)
+{
+    int8_t i;
+
+    for (i = 7; i >= 0; i--)
+    {
+        scl_low();
+        i2c_delay();
+
+        if (data & (1U << i))
+            sda_release();
         else
-            i2c_sda(0U);
+            sda_assert();
 
-        if (i2c_release_scl() == 0U)
-            return 0U;               /* clock stretch timeout */
-
-        i2c_scl(0U);                 /* SCL low for next bit */
-        data <<= 1U;
+        i2c_delay();
+        scl_high();
+        i2c_delay();
     }
 
-    /* Release SDA for slave ACK */
-    i2c_sda(1U);
-    if (i2c_release_scl() == 0U)
-        return 0U;                   /* clock stretch timeout */
-
-    ack = (uint8_t)((P6_REG & SDA_PIN) == 0U) ? 1U : 0U;
-    i2c_scl(0U);                     /* SCL low before next operation */
-    return ack;
+    scl_low();
+    i2c_delay();
+    return i2c_wait_ack();
 }
 
 /**
- * Read one byte from the I2C bus and send ACK or NACK.
+ * Receive one byte MSB-first from I2C.
  *
- * @param[in] send_ack  1 = send ACK (expect more data),
- *                      0 = send NACK (last byte).
- * @return  The received byte.
+ * @param[in] send_ack  1 to send ACK (more bytes to follow),
+ *                      0 to send NACK (last byte).
+ * @return The received byte.
  */
-static uint8_t i2c_rx_byte(uint8_t send_ack)
+static uint8_t i2c_read_byte(uint8_t send_ack)
 {
-    uint8_t i;
     uint8_t data = 0U;
+    int8_t  i;
 
-    i2c_sda(1U);                     /* release SDA for slave to drive */
+    sda_release();
 
-    for (i = 0U; i < 8U; i++)
+    for (i = 7; i >= 0; i--)
     {
-        data <<= 1U;
-        if (i2c_release_scl() == 0U)
-            return 0U;               /* clock stretch timeout */
+        scl_high();
+        i2c_delay();
 
-        if ((P6_REG & SDA_PIN) != 0U)
-            data |= 0x01U;
+        if (sda_read())
+            data |= (1U << i);
 
-        i2c_scl(0U);                 /* SCL low for next bit */
+        scl_low();
+        i2c_delay();
     }
 
-    /* ACK / NACK */
     if (send_ack)
-        i2c_sda(0U);                 /* ACK = SDA low */
+        i2c_ack();
     else
-        i2c_sda(1U);                 /* NACK = SDA high */
+        i2c_nack();
 
-    if (i2c_release_scl() == 0U)
-        return 0U;
-
-    i2c_scl(0U);                     /* SCL low */
-    i2c_sda(1U);                     /* release SDA */
     return data;
 }
 
@@ -225,153 +283,59 @@ static uint8_t i2c_rx_byte(uint8_t send_ack)
  * Public API
  ******************************************************************************/
 
-/**
- * Initialise the I2C bus.
- *
- * Configures P60 (SCL) and P61 (SDA) as open-drain outputs.
- * The bus is left idle (SCL high, SDA high).
- */
 void I2C_HAL_Init(void)
 {
-    /* Set P60 and P61 as outputs (PM6 bit 0, bit 1 cleared) */
-    PM6_REG &= ~(SCL_PIN | SDA_PIN);    /* both pins output */
-    P6_REG  |=   SCL_PIN | SDA_PIN;     /* bus idle high */
+    /* P60 (SCL) and P61 (SDA) as outputs, idle high */
+    PM6_REG  &= ~(SCL_PIN | SDA_PIN);   /* both output */
+    P6_REG   |=  SCL_PIN;              /* SCL high    */
+    P6_REG   |=  SDA_PIN;              /* SDA high    */
+
+    i2c_stop();                         /* reset any slaves */
 }
 
-/**
- * Read a sequence of bytes from an I2C slave device.
- *
- * Generates: START + slave_address(W) + register_address + STOP +
- *            START + slave_address(R) + data_bytes + STOP.
- *
- * @param[in]  dev_addr   7-bit slave address (left-justified).
- * @param[in]  reg_addr   Internal register address to read from.
- * @param[out] data       Output buffer for received bytes.
- * @param[in]  len        Number of bytes to read.
- * @return  0 on success, 1 on NACK or bus error.
- */
+uint8_t I2C_HAL_Write(uint8_t dev_addr, uint8_t reg_addr, uint8_t data)
+{
+    uint8_t status;
+
+    i2c_start();
+    status = i2c_write_byte((uint8_t)(dev_addr << 1) | 0x00U);  /* W */
+    if (status != 0U) { i2c_stop(); return status; }
+
+    status = i2c_write_byte(reg_addr);
+    if (status != 0U) { i2c_stop(); return status; }
+
+    status = i2c_write_byte(data);
+    if (status != 0U) { i2c_stop(); return status; }
+
+    i2c_stop();
+    return 0U;
+}
+
 uint8_t I2C_HAL_Read(uint8_t dev_addr, uint8_t reg_addr,
-                      uint8_t *data, uint16_t len)
+                     uint8_t *buffer, uint8_t length)
 {
-    uint16_t i;
+    uint8_t status;
+    uint8_t i;
 
+    /* Phase 1: write register address */
     i2c_start();
+    status = i2c_write_byte((uint8_t)(dev_addr << 1) | 0x00U);  /* W */
+    if (status != 0U) { i2c_stop(); return status; }
 
-    /* Write-phase: address + register */
-    if (i2c_tx_byte(dev_addr & 0xFEU) == 0U)   /* write, LSB = 0 */
-        return 1U;
-
-    if (i2c_tx_byte(reg_addr) == 0U)
-        return 1U;
-
-    /* Repeated START */
-    i2c_start();
-
-    /* Read-phase: address + data */
-    if (i2c_tx_byte(dev_addr | 0x01U) == 0U)   /* read, LSB = 1 */
-        return 1U;
-
-    for (i = 0U; i < len; i++)
-    {
-        uint8_t ack = (i < (len - 1U)) ? 1U : 0U;
-        data[i] = i2c_rx_byte(ack);
-    }
+    status = i2c_write_byte(reg_addr);
+    if (status != 0U) { i2c_stop(); return status; }
 
     i2c_stop();
-    return 0U;
-}
 
-/**
- * Write a sequence of bytes to an I2C slave device.
- *
- * Generates: START + slave_address(W) + register_address + data_bytes + STOP.
- *
- * @param[in]  dev_addr   7-bit slave address (left-justified).
- * @param[in]  reg_addr   Internal register address to write to.
- * @param[in]  data       Data buffer to transmit.
- * @param[in]  len        Number of bytes to write.
- * @return  0 on success, 1 on NACK or bus error.
- */
-uint8_t I2C_HAL_Write(uint8_t dev_addr, uint8_t reg_addr,
-                       const uint8_t *data, uint16_t len)
-{
-    uint16_t i;
-
+    /* Phase 2: repeated-start + read */
     i2c_start();
+    status = i2c_write_byte((uint8_t)(dev_addr << 1) | 0x01U);  /* R */
+    if (status != 0U) { i2c_stop(); return status; }
 
-    if (i2c_tx_byte(dev_addr & 0xFEU) == 0U)   /* write, LSB = 0 */
-        return 1U;
-
-    if (i2c_tx_byte(reg_addr) == 0U)
-        return 1U;
-
-    for (i = 0U; i < len; i++)
+    for (i = 0U; i < length; i++)
     {
-        if (i2c_tx_byte(data[i]) == 0U)
-            return 1U;
-    }
-
-    i2c_stop();
-    return 0U;
-}
-
-/**
- * Write a single byte to an I2C slave register (convenience wrapper).
- *
- * @param[in] dev_addr  7-bit slave address (left-justified).
- * @param[in] reg_addr  Internal register address.
- * @param[in] val       Byte to write.
- * @return  0 on success, 1 on error.
- */
-uint8_t I2C_HAL_WriteByte(uint8_t dev_addr, uint8_t reg_addr, uint8_t val)
-{
-    return I2C_HAL_Write(dev_addr, reg_addr, &val, 1U);
-}
-
-/**
- * Write then read a sequence of bytes from an I2C slave (combined format).
- *
- * Generates: START + addr(W) + reg_addr + (optional repeated start) +
- *            START + addr(R) + data_bytes + STOP.
- *
- * When reg_addr_len > 0, the register address is sent first in the
- * write phase.  When reg_addr_len == 0, the write phase is omitted
- * and only the read phase occurs (useful for devices that auto-increment).
- *
- * @param[in]  dev_addr     7-bit slave address (left-justified).
- * @param[in]  reg_addr     Pointer to register address bytes to send.
- * @param[in]  reg_addr_len Number of register address bytes (0 to skip).
- * @param[out] rx_data      Output buffer for received bytes.
- * @param[in]  rx_len       Number of bytes to read.
- * @return  0 on success, 1 on NACK or bus error.
- */
-uint8_t I2C_HAL_WriteRead(uint8_t dev_addr,
-                           const uint8_t *reg_addr, uint16_t reg_addr_len,
-                           uint8_t *rx_data, uint16_t rx_len)
-{
-    uint16_t i;
-
-    i2c_start();
-
-    if (i2c_tx_byte(dev_addr & 0xFEU) == 0U)   /* write, LSB = 0 */
-        return 1U;
-
-    for (i = 0U; i < reg_addr_len; i++)
-    {
-        if (i2c_tx_byte(reg_addr[i]) == 0U)
-            return 1U;
-    }
-
-    /* Repeated START */
-    i2c_start();
-
-    if (i2c_tx_byte(dev_addr | 0x01U) == 0U)   /* read, LSB = 1 */
-        return 1U;
-
-    for (i = 0U; i < rx_len; i++)
-    {
-        uint8_t ack = (i < (rx_len - 1U)) ? 1U : 0U;
-        rx_data[i] = i2c_rx_byte(ack);
+        uint8_t last = (uint8_t)(i == length - 1U);
+        buffer[i] = i2c_read_byte(last ? 0U : 1U);
     }
 
     i2c_stop();
