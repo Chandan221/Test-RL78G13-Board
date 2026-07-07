@@ -19,7 +19,7 @@
  * ======================
  *
  *   MCU:      Renesas R5F100SLAFB  (RL78/G13, 128-pin) on QB-R5F100SL-TB
- *   Clock:    20 MHz HOCO  (internal high-speed oscillator)
+ *   Clock:    8 MHz HOCO  (internal high-speed oscillator; 16.25 MHz requires sub-clock switch)
  *   Debugger: E2 Emulator Lite  (supplied with board)
  *   IMU:      MPU6050  (GY-521 breakout board)
  *   I2C:      Bit-bang on IICA0 pins  P60 (SCLA0) / P61 (SDAA0)
@@ -143,8 +143,8 @@ static volatile unsigned char * const csc_reg = (unsigned char *)0xFFF2F;
  * Timing constants
  ******************************************************************************/
 #define SAMPLE_INTERVAL_MS  100U    /**< Sensor read period (ms)          */
-#define BUSY_LOOP_CAL_1MS   650U    /**< Busy-loop iterations per ms
-                                          (empirical for 16.25 MHz HOCO)    */
+#define BUSY_LOOP_CAL_1MS   320U    /**< Busy-loop iterations per ms
+                                          (empirical for 8 MHz HOCO)        */
 
 /******************************************************************************
  * Private:  Utility functions
@@ -198,46 +198,35 @@ static void Init_LEDs(void)
 /******************************************************************************
  * Private:  Clock initialisation
  *
- * Configures the high-speed on-chip oscillator (HOCO) for the maximum
- * supported frequency (8 MHz or 16.25 MHz, depending on the specific
- * RL78/G13 variant).  The R5F100SLAFB (512 KB flash) supports 16.25 MHz
- * via CMC bit 7 (HOCODIV = 1).
- *
- * After reset the HOCO defaults to 8 MHz and the hdwinit.asm is empty,
- * so the CPU runs at 8 MHz unless this function is called.
+ * The RL78/G13 resets with the high-speed on-chip oscillator (HOCO) running
+ * at 8 MHz and hdwinit.asm is empty, so fCLK = 8 MHz by default.  This
+ * function ensures the clock is set to max speed (8 MHz) and that the CPU
+ * divider (CKC) is minimal.  (Changing HOCO to 16.25 MHz requires switching
+ * to the subsystem clock first, which TB boards may not have populated.)
  *
  * Registers used:
- *   CMC (0xFFF2C)  -- clock mode control
  *   CSC (0xFFF2F)  -- clock status / HOCO control
  *   CKC (0xFFF2E)  -- clock divider (fCLK = fMAIN / n)
  ******************************************************************************/
 
 /**
- * Bump the HOCO to its highest frequency and set fCLK = fMAIN / 1.
+ * Ensure fCLK = fMAIN / 1 with main clock source selected.
+ * HOCODIV remains at reset value (8 MHz) to avoid a sub-clock switch.
  */
 static void Clock_Init(void)
 {
-    /* Step 1: Stop HOCO before changing divider */
-    CSC |= 0x02U;
-    while ((CSC & 0x02U) == 0U);   /* wait until stopped */
+    /* Select main clock source (just in case CSS was changed by debugger) */
+    CSC &= ~0x80U;
 
-    /* Step 2: Set HOCODIV = 1  (16.25 MHz on 512 KB parts) */
-    CMC |= 0x80U;
-
-    /* Step 3: Restart HOCO */
-    CSC &= ~0x02U;
-    while ((CSC & 0x02U) != 0U);   /* wait until stable */
-
-    /* Step 4: Select main clock, no division */
-    CSC &= ~0x80U;                  /* CSS = 0 (main clock source) */
-    CKC  = 0x00U;                   /* fCLK = fMAIN / 1 */
+    /* fCLK = fMAIN / 1  -- maximum CPU clock */
+    CKC  = 0x00U;
 }
 
 /******************************************************************************
  * main  --  Application entry point
  *
  * Execution flow:
- *   0. Initialise clock (HOCO to 16.25 MHz).
+ *   0. Initialise clock (ensure fCLK = fMAIN / 1 at 8 MHz).
  *   1. Initialise LED GPIOs.
  *   2. Blink ERROR LED once as a visual power-on self-test.
  *   3. Initialise the I2C bus and TinyML classifier.
