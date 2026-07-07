@@ -1,0 +1,22 @@
+# Build outputs
+*.obj
+*.abs
+*.lib
+*.map
+HardwareDebug/
+Debug/
+
+# e2 studio project files (regenerate on import)
+.cproject
+.project
+.settings/
+*.launch
+*.rcpc
+generate/
+
+# IDE
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
